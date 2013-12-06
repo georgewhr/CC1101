@@ -35,6 +35,7 @@
 #include <asm/uaccess.h>
 
 #include "cc1101_rpi.h"
+#include "cc1101_ioctl.h"
 
 #define cc1101_dev_MAJOR			153	/* assigned */
 #define N_SPI_MINORS			0	/* ... up to 256 */
@@ -44,7 +45,7 @@ const char this_driver_name[] = "cc1101";
 static long open_times = 0;
 static LIST_HEAD(device_list);
 static DEFINE_MUTEX(device_list_lock);
-static long sync_busy = 0;
+static u8 sync_busy = 0;
 static long callbacks_ctr = 0;
 
 
@@ -109,7 +110,6 @@ static int __init cc1101_init(void)
     if (status < 0)
         return status;
 
-
 	if (cc1101_init_class() < 0)
 		goto fail_0;
 
@@ -121,7 +121,7 @@ fail_0:
 	class_destroy(cc1101_class);
 
 }
-module_init(cc1101_init);
+
 
 
 
@@ -182,7 +182,7 @@ static int __devinit cc1101_probe(struct spi_device *spi)
 	if (!cc1101)
 		return -ENOMEM;
 
-    cc1101_dev = spi;
+    cc1101_dev -> spi = spi;
 
     pin_lock_init(cc1101_dev -> spi_lock);
     mutex_init(cc1101_dev -> buf_lock);
@@ -426,6 +426,16 @@ static int cc1101_open(struct inode *inode, struct file *filp)
 
 }
 
+static long cc1101_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+
+
+}
+
+
+
+
+
 //This is called somewhere in kernel space
 static void cc1101_complete(void *arg)
 {
@@ -462,20 +472,47 @@ static ssize_t cc1101_sync(struct cc1101_data *cc1101_dev, struct spi_message *m
 	return status;
 }
 
-static inline ssize_t cc1101_sync_write(struct cc1101_data *cc1101, size_t len)
+static inline ssize_t cc1101_sync_write(struct cc1101_data *cc1101_dev, size_t len)
 {
-	struct spi_transfer	t = {
-			.tx_buf		= cc1101->buffer,
+    u8 send_cmd0 = CC1101_TXFIFO;
+    u8 send_cmd1 = CC1101_STX;
+    u8 send_cmd2 = CC1101_SFTX;
+
+	struct spi_transfer	t0 = {
+			.tx_buf		= &send_cmd0,
+			.len		= 1,
+		};
+
+    struct spi_transfer	t1 = {
+			.tx_buf		= cc1101_dev->buffer,
 			.len		= len,
 		};
+
+
+    struct spi_transfer	t2 = {
+			.tx_buf		= &send_cmd1,
+			.len		= 1,
+		};
+
+    struct spi_transfer	t3 = {
+			.tx_buf		= &send_cmd12,
+			.len		= 1,
+		};
+
 
 	struct spi_message	m;
 
 	spi_message_init(&m);
 
-	spi_message_add_tail(&t, &m); //To add transfers to a spi_message, use the spi_message_add_tail() function
+	spi_message_add_tail(&t0, &m);
 
-	return cc1101_sync(cc1101, &m);	// The core method for submitting any message to the SPI system is spi_async()
+	spi_message_add_tail(&t1, &m);
+
+	spi_message_add_tail(&t2, &m); //this is linked list, FIFO.
+
+	spi_message_add_tail(&t3, &m);
+
+	return cc1101_sync(cc1101_dev, &m);	// The core method for submitting any message to the SPI system is spi_async()
 }
 
 
@@ -502,4 +539,52 @@ static ssize_t cc1101_write(struct file *filp, const char __user *buf, size_t co
 
 }
 
+static inline ssize_t cc1101_sync_read(struct cc1101_data *cc1101_dev, size_t len)
+{
+    u8 *read_cmd = kmalloc(sizeof(u8) * 2, GFP_KERNEL);
+    *read_cmd = CC1101_SRX;
+    *(read_cmd + 1) = CC1101_RXFIFO;
+
+	struct spi_transfer	t = {
+			.tx_buf		= read_cmd,
+			.rx_buf     = &cc1101_dev -> buffer,
+			.len		= len,
+		};
+
+	struct spi_message	m;
+
+	spi_message_init(&m);
+
+	spi_message_add_tail(&t, &m); //this is linked list, FIFO.
+
+	return cc1101_sync(cc1101_dev, &m);	// The core method for submitting any message to the SPI system is spi_async()
+}
+
+static ssize_t cc1101_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+{
+    struct cc1101_data* cc1101_dev = (struct cc1101_data*)filp->private_data;
+    short status = 0;
+
+    mutex_lock(&cc1101_dev->buf_lock);
+
+    status = cc1101_sync_read(cc1101_dev, count);
+
+    if (copy_to_user(buf, cc1101_dev -> buffer, count))  {
+		printk(KERN_ALERT "cc1101_read(): copy_to_user() failed\n");
+		status = -EFAULT;
+	}
+
+	mutex_unlock(&cc1101_dev -> buf_lock);
+
+	return status;
+}
+
+module_init(cc1101_init);
+
+
+
+MODULE_AUTHOR("George Wang, <georgewhr@gmail.com>");
+MODULE_DESCRIPTION("User mode SPI device interface");
+MODULE_LICENSE("GPL");
+MODULE_ALIAS("spi:cc1101");
 
