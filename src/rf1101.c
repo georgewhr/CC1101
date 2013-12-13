@@ -62,8 +62,11 @@ static int cc1101_probe(struct spi_device *spi);
 static long cc1101_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 static ssize_t cc1101_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
 static int cc1101_release(struct inode *inode, struct file *filp);
-static int __devexit cc1101_remove(struct spi_device *spi);
+static int cc1101_remove(struct spi_device *spi);
 static int cc1101_open(struct inode *inode, struct file *filp);
+static int __init cc1101_init_class();
+static int __init cc1101_init_spi();
+
 
 
 
@@ -97,7 +100,7 @@ static struct spi_driver cc1101_driver = {
 		.owner = THIS_MODULE,
 	},
 	.probe = cc1101_probe,
-	.remove = __devexit_p(cc1101_remove),
+	.remove = cc1101_remove,
 };
 
 
@@ -114,11 +117,7 @@ static const struct file_operations cc1101_fops = {
 	 */
 	.write =	cc1101_write,
 	.read =		cc1101_read,
-    #if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35))
-    .ioctl = cc1101_ioctl
-    #else
-    .unlocked_ioctl = cc1101_ioctl
-    #endif
+    .unlocked_ioctl = cc1101_ioctl,
 	.open =		cc1101_open,
 	.release =	cc1101_release,
 	//.llseek =	no_llseek,
@@ -138,6 +137,8 @@ static int __init cc1101_init(void)
     if (status < 0)
         return status;
 
+    cc1101_init_spi();
+/*
 	if (cc1101_init_class() < 0)
 		goto fail_0;
 
@@ -148,7 +149,7 @@ fail_0:
 	device_destroy(cc1101_class, cc1101_dev.devt);
 	class_destroy(cc1101_class);
 
-
+*/
 }
 
 
@@ -170,21 +171,21 @@ static int __init cc1101_init_class()
 }
 
 
-static int __init c1101_init_spi()
+static int __init cc1101_init_spi()
 {
     int error;
 
     error = spi_register_driver(&cc1101_driver);
 	if (error < 0) {
-		printk(KERN_ALERT "cc1101_register_driver() failed %d\n", status);
+		printk(KERN_ALERT "cc1101_register_driver() failed %d\n", error);
 	}
 
 
-	error = add_cc1101_device_to_bus();//if you have implemented in board level, no need to call this function
+	/*error = add_cc1101_device_to_bus();//if you have implemented in board level, no need to call this function
 	if (error < 0) {
 		printk(KERN_ALERT "add_cc1101_to_bus() failed\n");
 		spi_unregister_driver(&cc1101_driver);
-	}
+	}*/
 
 	return error;
 
@@ -209,11 +210,11 @@ static int cc1101_probe(struct spi_device *spi)
 
     cc1101_dev -> spi = spi;
 
-    pin_lock_init(cc1101_dev -> spi_lock);
-    mutex_init(cc1101_dev -> buf_lock);
+    spin_lock_init(&cc1101_dev -> spi_lock);
+    mutex_init(&cc1101_dev -> buf_lock);
 	sema_init(& cc1101_dev -> fop_sem, SEMAPHORE_NUM);
 
-	INIT_LIST_HEAD(&cc1101_dev->device_entry)
+	INIT_LIST_HEAD(&cc1101_dev->device_entry);
 
     //device_create() will generate /dev/this_driver_name
     if (!device_create(cc1101_class, NULL, cc1101_dev -> devt, NULL,
@@ -228,7 +229,7 @@ static int cc1101_probe(struct spi_device *spi)
 
 }
 
-static int __devexit cc1101_remove(struct spi_device *spi)
+static int cc1101_remove(struct spi_device *spi)
 {
 	struct cc1101_data	*cc1101_dev = spi_get_drvdata(spi);
 
@@ -253,7 +254,7 @@ static int __devexit cc1101_remove(struct spi_device *spi)
 struct spi_transfer cc1101_make_transfer(u8 rgstr, u8 cmd, char *buf, u8 *rx )
 {
 
-    struct spi_transfer tr{
+    struct spi_transfer tr = {
      .tx_buf           = buf,
      .rx_buf           = rx,
      .len              = 2,
@@ -411,7 +412,7 @@ static int cc1101_setup(struct cc1101_data *cc1101_dev)
 struct spi_transfer cc1101_strobe_transfer(u8 *buf)
 {
 
-    struct spi_transfer tr{
+    struct spi_transfer tr = {
      .tx_buf           = buf,
      .rx_buf           = NULL,
      .len              = 2,
@@ -478,11 +479,11 @@ static long cc1101_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 
     struct cc1101_data *cc1101_dev = (struct cc1101_data*)filp->private_data;
-    struct spi_message *message;
+    struct spi_message *msg;
 
     struct spi_transfer tr;
 
-    spi_message_init(&msg);
+    spi_message_init(msg);
 
     cc1101_setup(cc1101_dev);
 
@@ -573,9 +574,9 @@ static long cc1101_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
      }
 
-     spi_message_add_tail(tr, &msg);
-     spi_sync(cc1101_dev -> spi, &msg);
-     spi_message_init(&msg);
+     spi_message_add_tail(&tr, msg);
+     spi_sync(cc1101_dev -> spi, msg);
+     spi_message_init(msg);
 
 }
 
@@ -642,7 +643,7 @@ static inline ssize_t cc1101_sync_write(struct cc1101_data *cc1101_dev, size_t l
 		};
 
     struct spi_transfer	t3 = {
-			.tx_buf		= &send_cmd12,
+			.tx_buf		= &send_cmd2,
 			.len		= 1,
 		};
 
