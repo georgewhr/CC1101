@@ -35,11 +35,20 @@
 #include <asm/uaccess.h>
 
 #include "cc1101_rpi.h"
-#include "cc1101_ioctl.h"
+#include "rf1101_ioctl.h"
 
-#define cc1101_dev_MAJOR			153	/* assigned */
+#define CC1101_DEV_MAJOR			153	/* assigned */
 #define N_SPI_MINORS			0	/* ... up to 256 */
 #define SPI_BUFF_SIZE	        8
+#define SEMAPHORE_NUM           13
+
+//Define device hot plugable
+#ifdef CONFIG_HOTPLUG
+#  define __devinit
+#else
+#  define __devinit __init
+#endif
+
 
 const char this_driver_name[] = "cc1101";
 static long open_times = 0;
@@ -47,6 +56,14 @@ static LIST_HEAD(device_list);
 static DEFINE_MUTEX(device_list_lock);
 static u8 sync_busy = 0;
 static long callbacks_ctr = 0;
+
+static ssize_t cc1101_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+static int cc1101_probe(struct spi_device *spi);
+static long cc1101_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+static ssize_t cc1101_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
+static int cc1101_release(struct inode *inode, struct file *filp);
+static int __devexit cc1101_remove(struct spi_device *spi);
+static int cc1101_open(struct inode *inode, struct file *filp);
 
 
 
@@ -71,7 +88,18 @@ struct cc1101_control{
 	struct spi_transfer transfer;
 	u32 spi_callbacks;
 	u8 *tx_buff;
-}
+};
+
+
+static struct spi_driver cc1101_driver = {
+	.driver = {
+		.name =	this_driver_name,
+		.owner = THIS_MODULE,
+	},
+	.probe = cc1101_probe,
+	.remove = __devexit_p(cc1101_remove),
+};
+
 
 //static struct cc1101_control cc1101_ctl;
 //static struct cc1101_data cc1101_dev;
@@ -106,7 +134,7 @@ static int __init cc1101_init(void)
 	memset(&cc1101_ctl, 0, sizeof(cc1101_ctl));
 	*/
 
-    status = register_chrdev(cc1101_dev_MAJOR, "spi", &cc1101_fops);
+    status = register_chrdev(CC1101_DEV_MAJOR, "spi", &cc1101_fops);
     if (status < 0)
         return status;
 
@@ -119,6 +147,7 @@ static int __init cc1101_init(void)
 fail_0:
 	device_destroy(cc1101_class, cc1101_dev.devt);
 	class_destroy(cc1101_class);
+
 
 }
 
@@ -143,10 +172,9 @@ static int __init cc1101_init_class()
 
 static int __init c1101_init_spi()
 {
-    int status;
+    int error;
 
-
-    status = spi_register_driver(&cc1101_driver);
+    error = spi_register_driver(&cc1101_driver);
 	if (error < 0) {
 		printk(KERN_ALERT "cc1101_register_driver() failed %d\n", status);
 	}
@@ -163,30 +191,27 @@ static int __init c1101_init_spi()
 }
 
 
-static struct spi_driver cc1101_driver = {
-	.driver = {
-		.name =	this_driver_name,
-		.owner = THIS_MODULE,
-	},
-	.probe = cc1101_probe,
-	.remove = __devexit_p(cc1101_remove),
-};
 
+/*The driver's init function calls spi_register_driver() in cc1101_init() which gives the kernel
+a list of devices it is able to service, along with a pointer to the probe() function.
+The kernel then calls the driver's probe() function once for each device.
+will be checked in spi ccore module spi.c
+*/
 
-static int __devinit cc1101_probe(struct spi_device *spi)
+static int cc1101_probe(struct spi_device *spi)
 {
     struct cc1101_data *cc1101_dev;
 
     cc1101_dev = kzalloc(sizeof(*cc1101_dev), GFP_KERNEL);
 
-	if (!cc1101)
+	if (!cc1101_dev)
 		return -ENOMEM;
 
     cc1101_dev -> spi = spi;
 
     pin_lock_init(cc1101_dev -> spi_lock);
     mutex_init(cc1101_dev -> buf_lock);
-	sema_init(cc1101_dev -> fop_sem, 13);
+	sema_init(& cc1101_dev -> fop_sem, SEMAPHORE_NUM);
 
 	INIT_LIST_HEAD(&cc1101_dev->device_entry)
 
@@ -198,6 +223,8 @@ static int __devinit cc1101_probe(struct spi_device *spi)
 		class_destroy(cc1101_class);
 		return -1;
 	}
+
+	return 0;
 
 }
 
@@ -223,152 +250,17 @@ static int __devexit cc1101_remove(struct spi_device *spi)
 	return 0;
 }
 
-static int cc1101_setup(struct cc1101_data *cc1101_dev)
-{
-    struct spi_message msg;
-    struct spi_transfer *tr = kmalloc(sizeof(struct spi_transfer) * 20, GFP_KERNEL);
-    u8 buffer[40];
-    memset(tr, NULL, 20);
-    spi_message_init(&msg);
-
-    tr[0] = cc1101_make_transfer(CC1101_IOCFG0, rfSettings.iocfg0, buffer, NULL);
-    tr[0].cs_change = 1;   //cs_change when set to 1 causes the CS line to go high between transfers in a spi_message series
-    spi_message_add_tail(tr, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[1] = cc1101_make_transfer(CC1101_FIFOTHR,   rfSettings.fifothr, buffer + 2, NULL);
-    tr[1].cs_change = 1;
-    spi_message_add_tail(tr + 1, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[2] = cc1101_make_transfer(CC1101_PKTCTRL0,   rfSettings.pktctrl0, buffer + 4, NULL);
-    tr[2].cs_change = 1;
-    spi_message_add_tail(tr + 2, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[3] = cc1101_make_transfer(CC1101_FSCTRL1,   rfSettings.fsctrl1, buffer + 6, NULL);
-    tr[3].cs_change = 1;
-    spi_message_add_tail(tr + 3, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[4] = cc1101_make_transfer(CC1101_FREQ2,   rfSettings.freq2, buffer + 8, NULL);
-    tr[4].cs_change = 1;
-    spi_message_add_tail(tr + 4, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[5] = cc1101_make_transfer(CC1101_FREQ1,   rfSettings.freq1, buffer + 10, NULL);
-    tr[5].cs_change = 1;
-    spi_message_add_tail(tr + 5, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[6] = cc1101_make_transfer(CC1101_FREQ0,   rfSettings.freq0, buffer + 12, NULL);
-    tr[6].cs_change = 1;
-    spi_message_add_tail(tr + 6, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[7] = cc1101_make_transfer(CC1101_MDMCFG4,   rfSettings.mdmcfg4, buffer + 14, NULL);
-    tr[7].cs_change = 1;
-    spi_message_add_tail(tr + 7, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[8] = cc1101_make_transfer(CC1101_MDMCFG3,   rfSettings.mdmcfg3, buffer + 16, NULL);
-    tr[8].cs_change = 1;
-    spi_message_add_tail(tr + 8, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[9] = cc1101_make_transfer(CC1101_MDMCFG2,   rfSettings.mdmcfg2, buffer + 18, NULL);
-    tr[9].cs_change = 1;
-    spi_message_add_tail(tr + 9, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[10] = cc1101_make_transfer(CC1101_DEVIATN,   rfSettings.deviatn ,buffer + 20, NULL);
-    tr[10].cs_change = 1;
-    spi_message_add_tail(tr + 10, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[11] = cc1101_make_transfer(CC1101_MCSM0,   rfSettings.mcsm0 ,buffer + 22, NULL);
-    tr[11].cs_change = 1;
-    spi_message_add_tail(tr + 11, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[12] = cc1101_make_transfer(CC1101_FOCCFG,   rfSettings.foccfg ,buffer + 24, NULL);
-    tr[12].cs_change = 1;
-    spi_message_add_tail(tr + 12, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[13] = cc1101_make_transfer(CC1101_WORCTRL,   rfSettings.worctrl ,buffer + 26, NULL);
-    tr[13].cs_change = 1;
-    spi_message_add_tail(tr + 13, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[14] = cc1101_make_transfer(CC1101_FSCAL3,   rfSettings.fscal3 ,buffer + 28, NULL);
-    tr[14].cs_change = 1;
-    spi_message_add_tail(tr + 14, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[15] = cc1101_make_transfer(CC1101_FSCAL2,   rfSettings.fscal2 ,buffer + 30, NULL);
-    tr[15].cs_change = 1;
-    spi_message_add_tail(tr + 15, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[16] = cc1101_make_transfer(CC1101_FSCAL1,   rfSettings.fscal1 ,buffer + 32, NULL);
-    tr[16].cs_change = 1;
-    spi_message_add_tail(tr + 16, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[17] = cc1101_make_transfer(CC1101_FSCAL0,   rfSettings.fscal0 ,buffer + 34, NULL);
-    tr[17].cs_change = 1;
-    spi_message_add_tail(tr + 17, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[18] = cc1101_make_transfer(CC1101_TEST2,   rfSettings.test2 ,buffer + 36, NULL);
-    tr[18].cs_change = 1;
-    spi_message_add_tail(tr + 18, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[19] = cc1101_make_transfer(CC1101_TEST1,   rfSettings.test1 ,buffer + 38, NULL);
-    tr[19].cs_change = 1;
-    spi_message_add_tail(tr + 19, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-
-    tr[20] = cc1101_make_transfer(CC1101_TEST0,   rfSettings.test0 ,buffer + 40, NULL);
-    tr[20].cs_change = 1;
-    spi_message_add_tail(tr + 20, &msg);
-    spi_sync(cc1101_dev -> spi, &msg)
-    spi_message_init(&msg);
-}
-
-struct spi_transfer cc1101_make_transfer(u8 rgstr, u8 cmd, u8 *buf, u8 *rx )
+struct spi_transfer cc1101_make_transfer(u8 rgstr, u8 cmd, char *buf, u8 *rx )
 {
 
     struct spi_transfer tr{
      .tx_buf           = buf,
-     .rx_buf           = rx_buf,
+     .rx_buf           = rx,
      .len              = 2,
      .cs_change        = 0,
      .bits_per_word    = 0,
      .delay_usecs      = 0,
-     .speed_hz         = 0
+     .speed_hz         = 0,
     };
 
     *buf = rgstr;
@@ -377,6 +269,162 @@ struct spi_transfer cc1101_make_transfer(u8 rgstr, u8 cmd, u8 *buf, u8 *rx )
     return tr;
 
 }
+
+static int cc1101_setup(struct cc1101_data *cc1101_dev)
+{
+    struct spi_message msg;
+    struct spi_transfer *tr = kmalloc(sizeof(struct spi_transfer) * 20, GFP_KERNEL);
+    char buffer[40];
+    memset(tr, NULL, 20);
+    spi_message_init(&msg);
+
+    tr[0] = cc1101_make_transfer(CC1101_IOCFG0, rfSettings.iocfg0, buffer, NULL);
+    tr[0].cs_change = 1;   //cs_change when set to 1 causes the CS line to go high between transfers in a spi_message series
+    spi_message_add_tail(tr, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[1] = cc1101_make_transfer(CC1101_FIFOTHR,   rfSettings.fifothr, buffer + 2, NULL);
+    tr[1].cs_change = 1;
+    spi_message_add_tail(tr + 1, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[2] = cc1101_make_transfer(CC1101_PKTCTRL0,   rfSettings.pktctrl0, buffer + 4, NULL);
+    tr[2].cs_change = 1;
+    spi_message_add_tail(tr + 2, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[3] = cc1101_make_transfer(CC1101_FSCTRL1,   rfSettings.fsctrl1, buffer + 6, NULL);
+    tr[3].cs_change = 1;
+    spi_message_add_tail(tr + 3, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[4] = cc1101_make_transfer(CC1101_FREQ2,   rfSettings.freq2, buffer + 8, NULL);
+    tr[4].cs_change = 1;
+    spi_message_add_tail(tr + 4, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[5] = cc1101_make_transfer(CC1101_FREQ1,   rfSettings.freq1, buffer + 10, NULL);
+    tr[5].cs_change = 1;
+    spi_message_add_tail(tr + 5, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[6] = cc1101_make_transfer(CC1101_FREQ0,   rfSettings.freq0, buffer + 12, NULL);
+    tr[6].cs_change = 1;
+    spi_message_add_tail(tr + 6, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[7] = cc1101_make_transfer(CC1101_MDMCFG4,   rfSettings.mdmcfg4, buffer + 14, NULL);
+    tr[7].cs_change = 1;
+    spi_message_add_tail(tr + 7, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[8] = cc1101_make_transfer(CC1101_MDMCFG3,   rfSettings.mdmcfg3, buffer + 16, NULL);
+    tr[8].cs_change = 1;
+    spi_message_add_tail(tr + 8, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[9] = cc1101_make_transfer(CC1101_MDMCFG2,   rfSettings.mdmcfg2, buffer + 18, NULL);
+    tr[9].cs_change = 1;
+    spi_message_add_tail(tr + 9, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[10] = cc1101_make_transfer(CC1101_DEVIATN,   rfSettings.deviatn ,buffer + 20, NULL);
+    tr[10].cs_change = 1;
+    spi_message_add_tail(tr + 10, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[11] = cc1101_make_transfer(CC1101_MCSM0,   rfSettings.mcsm0 ,buffer + 22, NULL);
+    tr[11].cs_change = 1;
+    spi_message_add_tail(tr + 11, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[12] = cc1101_make_transfer(CC1101_FOCCFG,   rfSettings.foccfg ,buffer + 24, NULL);
+    tr[12].cs_change = 1;
+    spi_message_add_tail(tr + 12, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[13] = cc1101_make_transfer(CC1101_WORCTRL,   rfSettings.worctrl ,buffer + 26, NULL);
+    tr[13].cs_change = 1;
+    spi_message_add_tail(tr + 13, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[14] = cc1101_make_transfer(CC1101_FSCAL3,   rfSettings.fscal3 ,buffer + 28, NULL);
+    tr[14].cs_change = 1;
+    spi_message_add_tail(tr + 14, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[15] = cc1101_make_transfer(CC1101_FSCAL2,   rfSettings.fscal2 ,buffer + 30, NULL);
+    tr[15].cs_change = 1;
+    spi_message_add_tail(tr + 15, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[16] = cc1101_make_transfer(CC1101_FSCAL1,   rfSettings.fscal1 ,buffer + 32, NULL);
+    tr[16].cs_change = 1;
+    spi_message_add_tail(tr + 16, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[17] = cc1101_make_transfer(CC1101_FSCAL0,   rfSettings.fscal0 ,buffer + 34, NULL);
+    tr[17].cs_change = 1;
+    spi_message_add_tail(tr + 17, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[18] = cc1101_make_transfer(CC1101_TEST2,   rfSettings.test2 ,buffer + 36, NULL);
+    tr[18].cs_change = 1;
+    spi_message_add_tail(tr + 18, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[19] = cc1101_make_transfer(CC1101_TEST1,   rfSettings.test1 ,buffer + 38, NULL);
+    tr[19].cs_change = 1;
+    spi_message_add_tail(tr + 19, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+
+    tr[20] = cc1101_make_transfer(CC1101_TEST0,   rfSettings.test0 ,buffer + 40, NULL);
+    tr[20].cs_change = 1;
+    spi_message_add_tail(tr + 20, &msg);
+    spi_sync(cc1101_dev -> spi, &msg);
+    spi_message_init(&msg);
+}
+
+
+
+
+struct spi_transfer cc1101_strobe_transfer(u8 *buf)
+{
+
+    struct spi_transfer tr{
+     .tx_buf           = buf,
+     .rx_buf           = NULL,
+     .len              = 2,
+     .cs_change        = 0,
+     .bits_per_word    = 0,
+     .delay_usecs      = 0,
+     .speed_hz         = 0,
+    };
+
+    return tr;
+
+}
+
 
 static int cc1101_open(struct inode *inode, struct file *filp)
 {
@@ -429,6 +477,105 @@ static int cc1101_open(struct inode *inode, struct file *filp)
 static long cc1101_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 
+    struct cc1101_data *cc1101_dev = (struct cc1101_data*)filp->private_data;
+    struct spi_message *message;
+
+    struct spi_transfer tr;
+
+    spi_message_init(&msg);
+
+    cc1101_setup(cc1101_dev);
+
+     switch (cmd)
+     {
+         case   CC1101_IOCTL_RESETCHIP:{
+             *(cc1101_dev -> buffer) = CC1101_SRES;
+             tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+             break;
+         }
+
+         case   CC1101_IOCTL_SFSTXON:{
+            *(cc1101_dev -> buffer) = CC1101_SFSTXON;
+             tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+             break;
+         }
+
+         case   CC1101_IOCTL_SXOFF:{
+            *(cc1101_dev -> buffer) = CC1101_SXOFF;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+         case   CC1101_IOCTL_SCAL:{
+            *(cc1101_dev -> buffer) = CC1101_SCAL;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+         case   CC1101_IOCTL_SRX:{
+            *(cc1101_dev -> buffer) = CC1101_SRX;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+         case   CC1101_IOCTL_STX:{
+            *(cc1101_dev -> buffer) = CC1101_STX;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+         case   CC1101_IOCTL_SIDLE :{
+            *(cc1101_dev -> buffer) = CC1101_SIDLE;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+         case   CC1101_IOCTL_SWOR  :{
+            *(cc1101_dev -> buffer) = CC1101_SWOR;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+         case   CC1101_IOCTL_SPWD  :{
+            *(cc1101_dev -> buffer) = CC1101_SPWD;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+         case   CC1101_IOCTL_SFRX  :{
+            *(cc1101_dev -> buffer) = CC1101_SFRX;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+         case   CC1101_IOCTL_SFTX  :{
+            *(cc1101_dev -> buffer) = CC1101_SFTX;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+         case   CC1101_IOCTL_SWORRST  :{
+            *(cc1101_dev -> buffer) = CC1101_SWORRST;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+         case   CC1101_IOCTL_SNOP  :{
+            *(cc1101_dev -> buffer) = CC1101_SNOP;
+            tr = cc1101_strobe_transfer(cc1101_dev -> buffer);
+            break;
+         }
+
+       /*  default:
+         {
+
+         }*/
+
+     }
+
+     spi_message_add_tail(tr, &msg);
+     spi_sync(cc1101_dev -> spi, &msg);
+     spi_message_init(&msg);
 
 }
 
@@ -449,8 +596,8 @@ static ssize_t cc1101_sync(struct cc1101_data *cc1101_dev, struct spi_message *m
 	DECLARE_COMPLETION_ONSTACK(done);
 	int status;
 
-	message->complete = cc1101_complete;
-	message->context = &done;
+	message -> complete = cc1101_complete;
+	message -> context = &done;
 
 	spin_lock_irq(&cc1101_dev -> spi_lock);
 	if (cc1101_dev -> spi == NULL)
@@ -575,6 +722,37 @@ static ssize_t cc1101_read(struct file *filp, char __user *buf, size_t count, lo
 	}
 
 	mutex_unlock(&cc1101_dev -> buf_lock);
+
+	return status;
+}
+
+
+static int cc1101_release(struct inode *inode, struct file *filp)
+{
+	struct cc1101_data	*cc1101;
+	int			status = 0;
+
+	mutex_lock(&device_list_lock);
+	cc1101 = filp->private_data;
+	filp->private_data = NULL;
+
+	/* last close? */
+	cc1101->users--;
+	if (!cc1101->users) {
+		int		dofree;
+
+		kfree(cc1101->buffer);
+		cc1101->buffer = NULL;
+
+		/* ... after we unbound from the underlying device? */
+		spin_lock_irq(&cc1101->spi_lock);
+		dofree = (cc1101->spi == NULL);
+		spin_unlock_irq(&cc1101->spi_lock);
+
+		if (dofree)
+			kfree(cc1101);
+	}
+	mutex_unlock(&device_list_lock);
 
 	return status;
 }
