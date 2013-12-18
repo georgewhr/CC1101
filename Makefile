@@ -1,5 +1,7 @@
-DRIVER = cc1101
-
+DRIVER = rf1101
+KERNELDIR=/home/gwang/raspi_tool/kernel-3.8
+CROSS_COMPILE=arm-linux-gnueabi-
+#KERNELDIR=/lib/modules/3.6.11+/kernel
 ifneq ($(KERNELRELEASE),)
     obj-m := $(DRIVER).o
 else
