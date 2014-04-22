@@ -2,4 +2,7 @@ COPYRIGHT
 George Wang
 georgewhr@gmail.com
 
-Remember to modify the platform device defince in board-spec.c
+Remember to modify the platform device defince in <board-spec>.c
+The driver is not under maintance because lacking of equipment to test the signal.
+
+
