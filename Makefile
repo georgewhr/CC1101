@@ -1,3 +1,4 @@
+# It's a test
 DRIVER = rf1101
 KERNELDIR=/home/gwang/raspi_tool/kernel-3.8
 CROSS_COMPILE=arm-linux-gnueabi-
